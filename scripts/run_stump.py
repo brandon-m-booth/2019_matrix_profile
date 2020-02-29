@@ -10,6 +10,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.sparse import csr_matrix, csc_matrix
 from sklearn.linear_model import OrthogonalMatchingPursuit
 from sklearn.linear_model import OrthogonalMatchingPursuitCV
 
@@ -31,12 +32,13 @@ def LoadAlignedTILESData(aligned_data_root_path):
 
    return data_dict
 
+#@profile
 def RunMP(aligned_data_root_path, output_path):
    do_compute_individual_k_motifs = True
    do_compute_anchored_chains = False
    do_compute_semantic_segmentation = False
    do_compute_multimodal_mp = False
-   window_size = 1500
+   window_size = 1300
    #window_size = 1500
    data_dict = LoadAlignedTILESData(aligned_data_root_path)
 
@@ -47,17 +49,19 @@ def RunMP(aligned_data_root_path, output_path):
 
    # Compute motifs from the individual MP using a greedy method
    if do_compute_individual_k_motifs:
-      num_motifs = 1
+      num_motifs = 2
       for pid in pids:
          fitbit_df = data_dict[pid]['fitbit']
-         fitbit_df = fitbit_df.iloc[0:4000,:] # HACK
+         fitbit_df = fitbit_df.iloc[0:10000,:] # HACK
 
          for stream in streams:
+            exclusion_signal = fitbit_df[stream].copy()
             # Keep a NaN'd version for MP and interpolated one for OMP
             #nan_replace_value = -1000000
             #fitbit_df[stream][np.isnan(fitbit_df[stream])] = nan_replace_value
             #fitbit_df_smooth = fitbit_df[stream].interpolate(method='linear', axis=0, inplace=False)
-            fitbit_df_smooth = fitbit_df[stream].copy()
+            #fitbit_df_smooth = fitbit_df[stream].copy()
+            fitbit_df_smooth = exclusion_signal.copy()
 
             if np.isnan(fitbit_df_smooth[0]): # Fill NaNs at the beginning and end
                idx = 0
@@ -73,11 +77,12 @@ def RunMP(aligned_data_root_path, output_path):
             # Use Matrix Profile methods to learn a motif dictionary
             motifs = []
             while len(motifs) < num_motifs:
-               fitbit_mp = stumpy.stump(fitbit_df[stream], m=window_size)
+               #fitbit_mp = stumpy.stump(fitbit_df[stream], m=window_size) # TODO - use the exclusion_signal
+               fitbit_mp = stumpy.stump(exclusion_signal, m=window_size) # TODO - use the exclusion_signal
                fitbit_mp_argsort = np.array(fitbit_mp[:,0]).argsort()
                for motif_idx in range(len(fitbit_mp_argsort)):
                   stream_motif_idx = fitbit_mp_argsort[motif_idx]
-                  num_nan = np.sum(np.isnan(fitbit_df[stream].values[stream_motif_idx:stream_motif_idx+window_size]))
+                  num_nan = np.sum(np.isnan(exclusion_signal.values[stream_motif_idx:stream_motif_idx+window_size]))
 
                   # Avoid finding bad motifs
                   if num_nan >= 5.0*window_size/6.0:
@@ -93,89 +98,108 @@ def RunMP(aligned_data_root_path, output_path):
 
             # Build a redundant dictionary from the motifs
             num_repetitions = len(fitbit_df_smooth)-window_size
-            dictionary_mat = np.zeros((len(motifs)*num_repetitions,len(fitbit_df_smooth)))
+            dictionary_mat = csr_matrix((len(motifs)*num_repetitions,len(fitbit_df_smooth)))
             for motif_idx in range(len(motifs)):
+               motif_values = motifs[motif_idx].values
                for repeat_idx in range(num_repetitions):
-                  dictionary_mat[motif_idx*num_repetitions + repeat_idx, repeat_idx:repeat_idx+window_size] = motifs[motif_idx].values
+                  # SLOW: TODO - find better way of generating this matrix.  Maybe I can change the sparse encoding directly and just push extra zeros in front of the motif sequence? Better yet, why not abandon the matrix representation and just use a list of motifs and their starting index in the signal
+                  dictionary_mat[motif_idx*num_repetitions + repeat_idx, repeat_idx:repeat_idx+window_size] = motif_values
 
             # Reconstruct the signal using the motif dictionary
             # TODO : Write my own OMP with exclusion of each atom's support. Gram mat?
             # TODO : Use L1 optimization (Lasso)?
             #omp = OrthogonalMatchingPursuit(n_nonzero_coefs=2, fit_intercept=False)
-            #omp = OrthogonalMatchingPursuitCV(fit_intercept=False)
-            #omp.fit(dictionary_mat.T, fitbit_df_smooth)
-            #intercept = omp.intercept_
-            #coef = omp.coef_
-            #idx_r = coef.nonzero()
-            #num_nonzero = omp.n_nonzero_coefs_
+            omp = OrthogonalMatchingPursuitCV(fit_intercept=False)
+            omp.fit(dictionary_mat.T, fitbit_df_smooth)
+            intercept = omp.intercept_
+            coef = omp.coef_
+            idx_r = coef.nonzero()
+            num_nonzero = omp.n_nonzero_coefs_
 
-            max_nonzero = 4
-            coef = np.zeros((dictionary_mat.T.shape[1],1))
-            intercept = np.zeros((dictionary_mat.T.shape[0],1))
-            exclusion_signal = fitbit_df[stream].copy()
-            for num_nonzero in range(1,max_nonzero+1):
-               # Reconstruct the signal using the motif dictionary
-               best_dict_idx = -1
-               best_error = np.inf
-               best_dict_support = None
-               for dict_idx in range(dictionary_mat.shape[0]):
-                  dict_vec = dictionary_mat[dict_idx,:]
+            #max_nonzero = 20
+            #skip_nan_percent = 0.1
+            #coef = np.zeros((dictionary_mat.T.shape[1],1))
+            #intercept = np.zeros((dictionary_mat.T.shape[0],1))
+            #for num_nonzero in range(1,max_nonzero+1):
+            #   # Reconstruct the signal using the motif dictionary
+            #   best_dict_idx = -1
+            #   best_error = np.inf
+            #   best_dict_support = None
+            #   for dict_idx in range(dictionary_mat.shape[0]):
+            #      # SLOW
+            #      dict_vec = dictionary_mat[dict_idx,:].toarray().reshape(-1,)
 
-                  # Find the support
-                  left_support_idx = 0
-                  right_support_idx = len(dict_vec)-1
-                  while dict_vec[left_support_idx] == 0 and left_support_idx < len(dict_vec):
-                     left_support_idx += 1
-                  while dict_vec[right_support_idx] == 0 and right_support_idx >= 0:
-                     right_support_idx -= 1
+            #      # Find the support
+            #      left_support_idx = 0
+            #      right_support_idx = len(dict_vec)-1
+            #      while dict_vec[left_support_idx] == 0 and left_support_idx < len(dict_vec):
+            #         left_support_idx += 1
+            #      while dict_vec[right_support_idx] == 0 and right_support_idx >= 0:
+            #         right_support_idx -= 1
 
-                  # Find the best match
-                  residual = exclusion_signal[left_support_idx:right_support_idx+1] - dict_vec[left_support_idx:right_support_idx+1]
-                  np.nan_to_num(residual, copy=False) # Replace NaN with zero
-                  error = np.dot(residual, residual)
-                  if error < best_error:
-                     best_error = error
-                     coef_val = 1 # TODO - constrain between 0.5 and 2?
-                     best_dict_idx = dict_idx
-                     best_dict_support = (left_support_idx, right_support_idx)
+            #      # Skip mostly NaN regions
+            #      if np.sum(np.isnan(exclusion_signal[left_support_idx:right_support_idx+1])) > skip_nan_percent*(right_support_idx-left_support_idx+1):
+            #         continue
 
-               if best_dict_idx < 0:
-                  print("No best next dictionary element found")
-                  break
+            #      # Find the best match
+            #      residual = exclusion_signal[left_support_idx:right_support_idx+1] - dict_vec[left_support_idx:right_support_idx+1]
+            #      np.nan_to_num(residual, copy=False) # Replace NaN with zero
+            #      error = np.dot(residual, residual)
+            #      if error < best_error:
+            #         best_error = error
+            #         coef_val = 1 # TODO - constrain between 0.5 and 2?
+            #         best_dict_idx = dict_idx
+            #         best_dict_support = (left_support_idx, right_support_idx)
 
-               # Update coef
-               coef_nonzero = (coef != 0).reshape(-1,)
-               if len(coef_nonzero) > 0:
-                  dictionary_mat_reduced = dictionary_mat[coef_nonzero, :]
-                  coef_reduced = coef[coef_nonzero]
+            #   if best_dict_idx < 0:
+            #      print("No best next dictionary element found")
+            #      break
 
-                  #prev_fit_signal = np.matmul(dictionary_mat.T, coef)
-                  prev_fit_signal = np.matmul(dictionary_mat_reduced.T, coef_reduced)
-                  prev_residual = fitbit_df_smooth - prev_fit_signal.reshape(-1,)
-               else:
-                  prev_residual = fitbit_df_smooth- np.zeros(len(fitbit_df_smooth))
-               np.nan_to_num(prev_residual, copy=False) # Replace NaN with zero
-               prev_error = np.dot(prev_residual, prev_residual)
+            #   # Update coef
+            #   coef_nonzero = (coef != 0).reshape(-1,)
+            #   if np.sum(coef_nonzero) > 0:
+            #      dictionary_mat_reduced = dictionary_mat[coef_nonzero, :]
+            #      coef_reduced = coef[coef_nonzero]
 
-               coef[best_dict_idx] = coef_val
-               #fit_signal = np.matmul(dictionary_mat.T, coef)
-               fit_signal = np.matmul(dictionary_mat_reduced.T, coef_reduced)
-               fit_residual = fitbit_df_smooth - prev_fit_signal.reshape(-1,)
-               np.nan_to_num(fit_residual, copy=False) # Replace NaN with zero
-               fit_error = np.dot(fit_residual, fit_residual)
+            #      #prev_fit_signal = np.matmul(dictionary_mat.T, coef)
+            #      prev_fit_signal = np.matmul(dictionary_mat_reduced.T.toarray(), coef_reduced)
+            #      prev_residual = fitbit_df_smooth - prev_fit_signal.reshape(-1,)
+            #      np.nan_to_num(prev_residual, copy=False) # Replace NaN with zero
+            #      prev_error = np.dot(prev_residual, prev_residual)
 
-               if best_dict_support is not None:
-                  exclusion_signal[best_dict_support[0]:best_dict_support[1]+1] = np.inf
+            #      coef[best_dict_idx] = coef_val
+            #      #fit_signal = np.matmul(dictionary_mat.T, coef)
+            #      fit_signal = np.matmul(dictionary_mat_reduced.T.toarray(), coef_reduced)
+            #      fit_residual = fitbit_df_smooth - fit_signal.reshape(-1,)
+            #      np.nan_to_num(fit_residual, copy=False) # Replace NaN with zero
+            #      fit_error = np.dot(fit_residual, fit_residual)
+            #   else:
+            #      prev_residual = fitbit_df_smooth- np.zeros(len(fitbit_df_smooth))
+            #      np.nan_to_num(prev_residual, copy=False) # Replace NaN with zero
+            #      prev_error = np.dot(prev_residual, prev_residual)
 
-               if prev_error < fit_error:
-                  print("Avoiding overfitting...")
-                  coef[best_dict_idx,0] = 0
-                  break
+            #      coef[best_dict_idx] = coef_val
+            #      coef_nonzero = (coef != 0).reshape(-1,)
+            #      dictionary_mat_reduced = dictionary_mat[coef_nonzero, :]
+            #      coef_reduced = coef[coef_nonzero]
+
+            #      fit_signal = np.matmul(dictionary_mat_reduced.T.toarray(), coef_reduced)
+            #      fit_residual = fitbit_df_smooth - fit_signal.reshape(-1,)
+            #      np.nan_to_num(fit_residual, copy=False) # Replace NaN with zero
+            #      fit_error = np.dot(fit_residual, fit_residual)
+
+            #   if best_dict_support is not None:
+            #      exclusion_signal[best_dict_support[0]:best_dict_support[1]+1] = np.inf
+
+            #   if prev_error < fit_error:
+            #      print("Avoiding overfitting...")
+            #      coef[best_dict_idx,0] = 0
+            #      break
 
             coef_nonzero = (coef != 0).reshape(-1,)
             dictionary_mat_reduced = dictionary_mat[coef_nonzero, :]
             coef_reduced = coef[coef_nonzero]
-            fit_signal = np.matmul(dictionary_mat_reduced.T, coef_reduced) + intercept
+            fit_signal = np.matmul(dictionary_mat_reduced.T.toarray(), coef_reduced) + intercept
             plt.plot(range(fitbit_df[stream].shape[0]), fitbit_df[stream], 'b-')
             #plt.plot(range(fitbit_df_smooth.shape[0]), fitbit_df_smooth, 'k-')
             plt.plot(range(fitbit_df[stream].shape[0]), fit_signal, 'r--')
@@ -183,6 +207,7 @@ def RunMP(aligned_data_root_path, output_path):
             plt.xlabel('Time')
             plt.ylabel(stream)
             plt.show()
+            return
             pdb.set_trace()
 
    # Compute individual matrix profiles (stump)
