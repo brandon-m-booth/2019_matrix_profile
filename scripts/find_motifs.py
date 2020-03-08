@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.sparse import csr_matrix, csc_matrix
+from scipy.stats import pearsonr, spearmanr, kendalltau
 
 do_show_plot = False
 
@@ -45,62 +46,103 @@ def OptimizeLinearProcrustes(x, y):
    return a, b
 
 # Input: signal (1D numpy array), dictionary (list of 1D numpy arrays)
-# Output: approximate signal
+# Output: approximate signal (1D array_, reconstruction data (list of tuples containing  motif data used to generate the approximate signal: (dict idx, frame offset, atom scale factor, atom shift amount) )
 def ReconstructSignalWithDictionary(signal, dictionary):
    skip_nan_percent = 0.1
 
-   num_atoms = 0
+   if len(dictionary) == 0:
+      return (np.nan*np.zeros(len(signal)), [])
+
+   # Compute and cache the optimzal fit coefficients for each atom and window
+   print("Fitting coefficients for each atom")
+   min_atom_len = min([len(x) for x in dictionary])
+   fit_data = np.inf*np.ones((len(dictionary), len(signal)-min_atom_len, 4)) # Format: dict_idx, window_idx, (a,b,num nan,error)
+   for dict_idx in range(len(dictionary)):
+      dict_vec = dictionary[dict_idx]
+      for i in range(len(signal) - len(dict_vec)):
+         left_idx = i
+         right_idx = left_idx+len(dict_vec)-1
+         a, b = OptimizeLinearProcrustes(dict_vec, signal[left_idx:right_idx+1])
+         num_nan = np.sum(np.isnan(signal[left_idx:right_idx+1]))
+         residual = signal[left_idx:right_idx+1] - (a*dict_vec+b)
+         np.nan_to_num(residual, copy=False)
+         error = np.dot(residual, residual)/(len(dict_vec)) # MSE
+         fit_data[dict_idx, i, :] = (a, b, num_nan, error)
+   
+   valid_mask = np.zeros((fit_data.shape[0], fit_data.shape[1])).astype(bool)
+   for dict_idx in range(len(dictionary)):
+      dict_len = len(dictionary[dict_idx])
+      nan_mask = fit_data[dict_idx,:,2] < skip_nan_percent*dict_len
+      coef_mask = fit_data[dict_idx,:,0] >= 0
+      valid_mask[dict_idx,:] = np.logical_and(nan_mask, coef_mask)
+
+   masked_error_data = fit_data[:,:,3].copy()
+   masked_error_data[~valid_mask] = np.inf
    signal_fit = np.nan*np.zeros(len(signal))
-   masked_signal = signal.copy()
+   reconstruction_data = []
+   num_atoms = 0
    while True:
-      # Reconstruct the signal using the motif dictionary
-      best_dict_idx = -1
-      best_dict_coefs = None
-      best_dict_frame = np.nan
-      best_error = np.inf
-      for dict_idx in range(len(dictionary)):
-         dict_vec = dictionary[dict_idx]
-
-         for i in range(len(signal) - len(dict_vec)):
-            left_idx = i
-            right_idx = left_idx+len(dict_vec)-1
-
-            # Skip mostly NaN regions
-            if np.sum(np.isnan(masked_signal[left_idx:right_idx+1])) > skip_nan_percent*(right_idx-left_idx+1):
-               continue
-
-            # Find the best fit
-            a, b = OptimizeLinearProcrustes(dict_vec, masked_signal[left_idx:right_idx+1])
-            if np.isnan(a) or np.isnan(b) or a <= 0: # Do not allow 'flipped' dictionary fits
-               continue
-            #if a < 0.5 or a > 2.0: # TODO - create better bounds!
-            #   continue
-            best_fit = a*dict_vec + b
-            residual = masked_signal[left_idx:right_idx+1] - best_fit
-            np.nan_to_num(residual, copy=False) # Replace NaN with zero
-            error = np.dot(residual, residual)
-            if error < best_error:
-               best_error = error
-               best_dict_idx = dict_idx
-               best_dict_coefs = (a,b)
-               best_dict_frame = i
-
-      if best_dict_idx < 0:
-         print("No best next dictionary element found")
-         break
-      else:
+      min_error_idx = np.argmin(masked_error_data)
+      min_error_idx = np.unravel_index(min_error_idx, masked_error_data.shape)
+      if not np.isinf(masked_error_data[min_error_idx]):
          num_atoms += 1
-         dict_len = len(dictionary[best_dict_idx])
-         dict_signal = best_dict_coefs[0]*dictionary[best_dict_idx] + best_dict_coefs[1]
-         signal_fit[best_dict_frame:best_dict_frame+dict_len] = dict_signal
-         masked_signal[best_dict_frame:best_dict_frame+dict_len] = np.inf
-      
-      #plt.plot(range(len(signal)), signal, 'b--')
-      #plt.plot(range(len(signal_fit)), signal_fit, 'r-', linewidth=2)
-      #plt.title('Reconstructed signal with %d atom(s)'%(num_atoms))
-      #plt.show()
+         dict_len = len(dictionary[min_error_idx[0]])
+         a = fit_data[min_error_idx[0], min_error_idx[1], 0]
+         b = fit_data[min_error_idx[0], min_error_idx[1], 1]
+         dict_signal = a*dictionary[min_error_idx[0]]+b
+         signal_fit[min_error_idx[1]:min_error_idx[1]+dict_len] = dict_signal
 
-   return signal_fit, np.isinf(masked_signal)
+         reconstruction_data.append((min_error_idx[0], min_error_idx[1], a, b))
+
+         #print("--------------------")
+         #print("Min idx: (%d,%d)"%(min_error_idx))
+         #print("A: %f, B: %f"%(a, b))
+         #plt.plot(range(len(signal)), signal, 'b--')
+         #plt.plot(range(len(signal_fit)), signal_fit, 'r-', linewidth=2)
+         #plt.title('Reconstructed signal with %d atom(s)'%(num_atoms))
+         #plt.show()
+
+         # Update the masked error data to prevent atom overlap
+         for i in range(len(dictionary)):
+            dict_len = len(dictionary[i])
+            left_mask_idx = max(0, min_error_idx[1]-dict_len+1)
+            right_mask_idx = min(fit_data.shape[1], min_error_idx[1]+dict_len-1)
+            masked_error_data[i, left_mask_idx:right_mask_idx+1] = np.inf
+      else:
+         break
+      
+   return signal_fit, reconstruction_data
+
+def ExtractFeatures(routine_signal, signal, motifs, motifs_data, reconstruction_data):
+   # Routineness (binary, scale factor and shift, duplicity, reconstruction correlation (pearson, spearman, kendall's tau)
+   feature_cols = ['routineness_binary', 'routineness_scale', 'routineness_shift', 'routineness_duplicity', 'routineness_pearson', 'routineness_spearman', 'routineness_kendall_tau']
+   features_df = pd.DataFrame(data=np.zeros((signal.shape[0], len(feature_cols))), index=signal.index, columns=feature_cols)
+
+   for recon_idx in range(len(reconstruction_data)):
+      (motif_idx, frame_offset, atom_scale, atom_shift) = reconstruction_data[recon_idx]
+      motif = motifs[motif_idx]
+      chain = motifs_data[motif_idx]
+      left_index = frame_offset+signal.index[0]
+      right_index = left_index+len(motif)-1
+      routine_signal_subseq = routine_signal[left_index:right_index+1]
+      signal_subseq = signal[left_index:right_index+1]
+      routine_invalid_mask = np.logical_or(np.isnan(routine_signal_subseq), np.isinf(routine_signal_subseq))
+      signal_invalid_mask = np.logical_or(np.isnan(signal_subseq), np.isinf(signal_subseq))
+      valid_mask = ~np.logical_or(routine_invalid_mask, signal_invalid_mask)
+      routine_signal_subseq_valid = routine_signal_subseq[valid_mask]
+      signal_subseq_valid = signal_subseq[valid_mask]
+
+      routineness_binary = 1
+      routineness_scale = atom_scale
+      routineness_shift = atom_shift
+      routineness_duplicity = chain.shape[0]
+      routineness_pearson = pearsonr(signal_subseq_valid, routine_signal_subseq_valid)[0]
+      routineness_spearman = spearmanr(signal_subseq_valid, routine_signal_subseq_valid)[0]
+      routineness_kendalltau = kendalltau(signal_subseq_valid, routine_signal_subseq_valid)[0]
+
+      features_df.loc[left_index:right_index+1,:] = [routineness_binary, routineness_scale, routineness_shift, routineness_duplicity, routineness_pearson, routineness_spearman, routineness_kendalltau]
+
+   return features_df
 
 #@profile
 def RunMP(aligned_data_root_path, output_path):
@@ -110,8 +152,11 @@ def RunMP(aligned_data_root_path, output_path):
    window_size = 1300
    streams = ['HeartRatePPG', 'StepCount']
 
+   if not os.path.isdir(output_path):
+      os.makedirs(output_path)
+
    data_dict = LoadAlignedTILESData(aligned_data_root_path)
-   pids = list(data_dict.keys())[2:]
+   pids = list(data_dict.keys())
 
    # Compute motifs from the individual MP using a greedy method
    for pid in pids:
@@ -124,6 +169,7 @@ def RunMP(aligned_data_root_path, output_path):
 
          # Use Matrix Profile methods to learn a motif dictionary
          motifs = []
+         motifs_data = []
          while len(motifs) < max_num_motifs:
             print("Number of motifs found: %d"%(len(motifs)))
             masked_signal = signal.copy()
@@ -158,19 +204,24 @@ def RunMP(aligned_data_root_path, output_path):
                # TODO - Which part of the chain should be the motif?
                motif = signal.iloc[unanchored_chain[0]:unanchored_chain[0]+window_size].values
                motifs.append(motif)
+               motifs_data.append(unanchored_chain)
                for i in range(unanchored_chain.shape[0]):
                   exclusion_mask[unanchored_chain[i]:unanchored_chain[i]+window_size] = True
             else:
                break
 
-         routine_signal, routine_mask = ReconstructSignalWithDictionary(signal, motifs)
+         routine_signal, reconstruction_data = ReconstructSignalWithDictionary(signal, motifs)
 
-         fig, ax = plt.subplots(2, sharex=True, gridspec_kw={'hspace':0})
-         plt.suptitle('Fitbit %s with routines removed'%(stream))
-         ax[0].plot(signal_df.index, signal, 'b-')
-         ax[1].plot(signal_df.index, signal, 'b--')
-         ax[1].plot(signal_df.index, routine_signal, 'g-', linewidth=3)
-         plt.show()
+         features_df = ExtractFeatures(routine_signal, signal, motifs, motifs_data, reconstruction_data)
+         features_df.to_csv(os.path.join(output_path, '%s_routine_features.csv'%(pid)), index=False, header=True)
+
+         if do_show_plot:
+            fig, ax = plt.subplots(2, sharex=True, gridspec_kw={'hspace':0})
+            plt.suptitle('Fitbit %s with routines removed'%(stream))
+            ax[0].plot(signal_df.index, signal, 'b-')
+            ax[1].plot(signal_df.index, signal, 'b--')
+            ax[1].plot(signal_df.index, routine_signal, 'g-', linewidth=3)
+            plt.show()
 
    return
 
